@@ -1,0 +1,245 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.mixed_precision import set_global_policy
+
+# Enable mixed precision
+set_global_policy('mixed_float16')
+
+# Set data path
+data_path = '/content/drive/MyDrive/Independent Environmental Science Project/Datasets/combined_climate_data.npy'
+
+# Load the data
+data = np.load(data_path, mmap_mode='r')
+
+# Calculate total number of samples
+total_samples = 100 * 90  # 9000 samples (100 months, 10x9 grid)
+
+# Create random indices for training and testing
+np.random.seed(42)  # for reproducibility
+all_indices = np.random.permutation(total_samples)
+train_indices = all_indices[:7200]
+test_indices = all_indices[7200:]
+
+def generate_sample(index):
+    month = index // 90 + 12  # Start from 12th month (0-based index)
+    block = index % 90
+    row = block // 9  # 0-9 for 10 rows
+    col = block % 9  # 0-8 for 9 columns
+
+    X = data[:, month-12:month, row, col]  # Shape: (4, 12, 64, 64, 3)
+    y = data[0, month, row, col]  # Shape: (64, 64, 3)
+
+    # Replace NaN values with 0
+    X = np.nan_to_num(X, nan=0.0)
+    y = np.nan_to_num(y, nan=0.0)
+
+    return X, y
+
+def create_dataset(indices, batch_size):
+    def gen():
+        for index in indices:
+            yield generate_sample(index)
+
+    dataset = tf.data.Dataset.from_generator(
+        gen,
+        output_signature=(
+            tf.TensorSpec(shape=(4, 12, 64, 64, 3), dtype=tf.float32),
+            tf.TensorSpec(shape=(64, 64, 3), dtype=tf.float32)
+        )
+    )
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE).repeat()
+
+class TransformerEncoder(layers.Layer):
+    def __init__(self, emb_dim, num_heads, hidden_dim):
+        super(TransformerEncoder, self).__init__()
+        self.attn = layers.MultiHeadAttention(num_heads=num_heads, key_dim=emb_dim)
+        self.ffn = models.Sequential([
+            layers.Dense(hidden_dim, activation='relu'),
+            layers.Dense(emb_dim)
+        ])
+        self.layernorm1 = layers.LayerNormalization()
+        self.layernorm2 = layers.LayerNormalization()
+        self.dropout1 = layers.Dropout(0.1)
+        self.dropout2 = layers.Dropout(0.1)
+
+    def call(self, x):
+        attn_output = self.attn(x, x)
+        out1 = self.layernorm1(x + self.dropout1(attn_output))
+        ffn_output = self.ffn(out1)
+        return self.layernorm2(out1 + self.dropout2(ffn_output))
+
+class ConvLSTMCell(layers.Layer):
+    def __init__(self, hidden_dim):
+        super(ConvLSTMCell, self).__init__()
+        self.convlstm = layers.ConvLSTM2D(hidden_dim, kernel_size=3, padding='same', return_sequences=True)
+
+    def call(self, x):
+        return self.convlstm(x)
+
+class UNetDecoderBlock(layers.Layer):
+    def __init__(self, out_channels):
+        super(UNetDecoderBlock, self).__init__()
+        self.conv = models.Sequential([
+            layers.Conv2D(out_channels, kernel_size=3, padding='same', activation='relu'),
+            layers.Conv2D(out_channels, kernel_size=3, padding='same', activation='relu')
+        ])
+
+    def call(self, x):
+        return self.conv(x)
+
+class PatchEmbedding(layers.Layer):
+    def __init__(self, patch_size, emb_dim):
+        super(PatchEmbedding, self).__init__()
+        self.patch_size = patch_size
+        self.emb_dim = emb_dim
+        self.conv = layers.Conv3D(emb_dim, kernel_size=patch_size, strides=patch_size)
+
+    def call(self, x):
+        # Reshape to combine batch and time dimensions
+        batch_size, time_steps, depth, height, width, channels = tf.unstack(tf.shape(x))
+        x = tf.reshape(x, [-1, depth, height, width, channels])
+        x = self.conv(x)
+        # Reshape back to separate batch and time dimensions
+        new_depth, new_height, new_width = x.shape[1:4]
+        x = tf.reshape(x, [batch_size, time_steps, new_depth, new_height, new_width, self.emb_dim])
+        return x
+
+class SWETransUNet(models.Model):
+    def __init__(self, in_channels=3, emb_dim=384, num_heads=4, hidden_dim=512, num_layers=2, patch_size=(2,4,4)):
+        super(SWETransUNet, self).__init__()
+        self.patch_embed = PatchEmbedding(patch_size, emb_dim)
+        self.encoder = [TransformerEncoder(emb_dim, num_heads, hidden_dim) for _ in range(num_layers)]
+        self.conv_lstm = ConvLSTMCell(emb_dim)
+        self.decoder = [
+            UNetDecoderBlock(192),
+            UNetDecoderBlock(96),
+            UNetDecoderBlock(48),
+            UNetDecoderBlock(32)
+        ]
+        self.final_conv = layers.Conv2D(3, kernel_size=1)
+        self.upsample = layers.UpSampling2D(size=(2, 2))
+
+    def call(self, x):
+        x = self.patch_embed(x)
+
+        batch_size, time_steps, depth, height, width, channels = tf.unstack(tf.shape(x))
+        x = tf.reshape(x, [batch_size * time_steps * depth, height * width, channels])
+
+        for encoder_layer in self.encoder:
+            x = encoder_layer(x)
+
+        x = tf.reshape(x, [batch_size, time_steps * depth, height, width, channels])
+
+        x = self.conv_lstm(x)
+
+        x = x[:, -1]
+
+        for i, decoder_layer in enumerate(self.decoder):
+            x = decoder_layer(x)
+            if i < 2:  # Upsample twice to reach 64x64
+                x = self.upsample(x)
+
+        x = self.final_conv(x)
+        return x
+
+batch_size = 4  # Increased batch size for faster training
+train_dataset = create_dataset(train_indices, batch_size)
+test_dataset = create_dataset(test_indices, batch_size)
+
+# Calculate steps per epoch
+steps_per_epoch = len(train_indices) // batch_size
+validation_steps = len(test_indices) // batch_size
+
+# Create and compile the model
+model = SWETransUNet()
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5, clipnorm=1.0)
+model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
+
+# Train the model with callbacks for early stopping and reducing learning rate
+early_stopping = tf.keras.callbacks.EarlyStopping(patience=3, restore_best_weights=True)
+reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(factor=0.2, patience=2)
+
+history = model.fit(
+    train_dataset,
+    epochs=5,  # Reduced to 5 epochs
+    validation_data=test_dataset,
+    steps_per_epoch=steps_per_epoch,
+    validation_steps=validation_steps,
+    callbacks=[early_stopping, reduce_lr],
+    verbose=1
+)
+
+# Print final metrics
+print(f"Final Training Loss: {history.history['loss'][-1]:.4f}")
+print(f"Final Training MAE: {history.history['mae'][-1]:.4f}")
+print(f"Final Validation Loss: {history.history['val_loss'][-1]:.4f}")
+print(f"Final Validation MAE: {history.history['val_mae'][-1]:.4f}")
+
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['mae'], label='Training MAE')
+plt.plot(history.history['val_mae'], label='Validation MAE')
+plt.title('Model MAE')
+plt.xlabel('Epoch')
+plt.ylabel('MAE')
+plt.legend()
+
+plt.tight_layout()
+plt.savefig('/content/drive/MyDrive/Independent Environmental Science Project/Plots/training_history.png')
+plt.show()
+
+# Print final metrics
+print(f"Final Training Loss: {history.history['loss'][-1]:.4f}")
+print(f"Final Training MAE: {history.history['mae'][-1]:.4f}")
+print(f"Final Validation Loss: {history.history['val_loss'][-1]:.4f}")
+print(f"Final Validation MAE: {history.history['val_mae'][-1]:.4f}")
+
+# Save the model
+model.save('/content/drive/MyDrive/Independent Environmental Science Project/Model/SWETransUNet_model.keras')
+
+# Save the training history
+import pickle
+with open('/content/drive/MyDrive/Independent Environmental Science Project/Model/training_history.pkl', 'wb') as f:
+    pickle.dump(history.history, f)
+
+# Visualize model architecture
+tf.keras.utils.plot_model(model, to_file='/content/drive/MyDrive/Independent Environmental Science Project/Plots/model_architecture.png', show_shapes=True, show_layer_names=True)
+
+# Generate and plot sample predictions
+def plot_sample_predictions(model, dataset, num_samples=5):
+    plt.figure(figsize=(20, 4*num_samples))
+    for i, (X, y_true) in enumerate(dataset.take(num_samples)):
+        y_pred = model.predict(X)
+
+        for j in range(3):  # Plot each channel
+            plt.subplot(num_samples, 9, i*9 + j*3 + 1)
+            plt.imshow(X[0, -1, 0, :, :, j], cmap='viridis')
+            plt.title(f'Input Ch{j}')
+            plt.axis('off')
+
+            plt.subplot(num_samples, 9, i*9 + j*3 + 2)
+            plt.imshow(y_true[0, :, :, j], cmap='viridis')
+            plt.title(f'True Ch{j}')
+            plt.axis('off')
+
+            plt.subplot(num_samples, 9, i*9 + j*3 + 3)
+            plt.imshow(y_pred[0, :, :, j], cmap='viridis')
+            plt.title(f'Pred Ch{j}')
+            plt.axis('off')
+
+    plt.tight_layout()
+    plt.savefig('/content/drive/MyDrive/Independent Environmental Science Project/Plots/sample_predictions.png')
+    plt.show()
+
+plot_sample_predictions(model, test_dataset)
+
+print("All visualizations have been saved in the 'Plots' folder.")
