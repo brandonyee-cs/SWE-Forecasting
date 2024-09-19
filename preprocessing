@@ -7,7 +7,7 @@ from tensorflow.keras.mixed_precision import set_global_policy
 set_global_policy('mixed_float16')
 
 # Set data path
-data_path = '/content/drive/MyDrive/Independent Environmental Science Project/Datasets/combined_climate_data.npy'
+data_path = # Enter file path here
 
 # Load the data
 data = np.load(data_path, mmap_mode='r')
