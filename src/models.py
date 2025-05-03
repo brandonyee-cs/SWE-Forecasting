@@ -1,0 +1,92 @@
+class TransformerEncoder(layers.Layer):
+    def __init__(self, emb_dim, num_heads, hidden_dim):
+        super(TransformerEncoder, self).__init__()
+        self.attn = layers.MultiHeadAttention(num_heads=num_heads, key_dim=emb_dim)
+        self.ffn = models.Sequential([
+            layers.Dense(hidden_dim, activation='relu'),
+            layers.Dense(emb_dim)
+        ])
+        self.layernorm1 = layers.LayerNormalization()
+        self.layernorm2 = layers.LayerNormalization()
+        self.dropout1 = layers.Dropout(0.1)
+        self.dropout2 = layers.Dropout(0.1)
+
+    def call(self, x):
+        attn_output = self.attn(x, x)
+        out1 = self.layernorm1(x + self.dropout1(attn_output))
+        ffn_output = self.ffn(out1)
+        return self.layernorm2(out1 + self.dropout2(ffn_output))
+
+class ConvLSTMCell(layers.Layer):
+    def __init__(self, hidden_dim):
+        super(ConvLSTMCell, self).__init__()
+        self.convlstm = layers.ConvLSTM2D(hidden_dim, kernel_size=3, padding='same', return_sequences=True)
+
+    def call(self, x):
+        return self.convlstm(x)
+
+class UNetDecoderBlock(layers.Layer):
+    def __init__(self, out_channels):
+        super(UNetDecoderBlock, self).__init__()
+        self.conv = models.Sequential([
+            layers.Conv2D(out_channels, kernel_size=3, padding='same', activation='relu'),
+            layers.Conv2D(out_channels, kernel_size=3, padding='same', activation='relu')
+        ])
+
+    def call(self, x):
+        return self.conv(x)
+
+class PatchEmbedding(layers.Layer):
+    def __init__(self, patch_size, emb_dim):
+        super(PatchEmbedding, self).__init__()
+        self.patch_size = patch_size
+        self.emb_dim = emb_dim
+        self.conv = layers.Conv3D(emb_dim, kernel_size=patch_size, strides=patch_size)
+
+    def call(self, x):
+        # Reshape to combine batch and time dimensions
+        batch_size, time_steps, depth, height, width, channels = tf.unstack(tf.shape(x))
+        x = tf.reshape(x, [-1, depth, height, width, channels])
+        x = self.conv(x)
+        # Reshape back to separate batch and time dimensions
+        new_depth, new_height, new_width = x.shape[1:4]
+        x = tf.reshape(x, [batch_size, time_steps, new_depth, new_height, new_width, self.emb_dim])
+        return x
+
+class SWETransUNet(models.Model):
+    def __init__(self, in_channels=3, emb_dim=384, num_heads=4, hidden_dim=512, num_layers=2, patch_size=(2,4,4)):
+        super(SWETransUNet, self).__init__()
+        self.patch_embed = PatchEmbedding(patch_size, emb_dim)
+        self.encoder = [TransformerEncoder(emb_dim, num_heads, hidden_dim) for _ in range(num_layers)]
+        self.conv_lstm = ConvLSTMCell(emb_dim)
+        self.decoder = [
+            UNetDecoderBlock(192),
+            UNetDecoderBlock(96),
+            UNetDecoderBlock(48),
+            UNetDecoderBlock(32)
+        ]
+        self.final_conv = layers.Conv2D(3, kernel_size=1)
+        self.upsample = layers.UpSampling2D(size=(2, 2))
+
+    def call(self, x):
+        x = self.patch_embed(x)
+
+        batch_size, time_steps, depth, height, width, channels = tf.unstack(tf.shape(x))
+        x = tf.reshape(x, [batch_size * time_steps * depth, height * width, channels])
+
+        for encoder_layer in self.encoder:
+            x = encoder_layer(x)
+
+        x = tf.reshape(x, [batch_size, time_steps * depth, height, width, channels])
+
+        x = self.conv_lstm(x)
+
+        x = x[:, -1]
+
+        for i, decoder_layer in enumerate(self.decoder):
+            x = decoder_layer(x)
+            if i < 2:  # Upsample twice to reach 64x64
+                x = self.upsample(x)
+
+        x = self.final_conv(x)
+        return x
