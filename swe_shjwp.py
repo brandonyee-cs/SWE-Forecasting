@@ -782,7 +782,7 @@ def train_model(model, train_loader, val_loader, num_epochs, lr, results_directo
                 val_r2_epoch += r2 * batch_size
                 val_samples += batch_size
         
-        current_val_mse = float('inf')
+        current_va_mse = float('inf')
         if val_samples > 0:
             current_val_mse = val_mse_epoch / val_samples
             metrics_history['val_mse'].append(current_val_mse)
@@ -988,13 +988,13 @@ def clean_cache(cache_dir_to_clean, keep_best_model=True):
                 print(f"Error deleting {file_path}: {e}")
 
     print(f"Cleaned {deleted_size / (1024 ** 2):.2f} MB of {total_size / (1024 ** 2):.2f} MB from cache {cache_dir_to_clean}")
-
+    
 
 if __name__ == "__main__":
     # --- Directory Definitions ---
     
     # User-specified path for XML data files
-    xml_input_data_path = "/data/" 
+    xml_input_data_path = "/home/brand/IMSS/SWE/data" 
 
     # Base path for outputs (cache, results, models) - current directory by default
     output_base_path = "." 
@@ -1033,7 +1033,7 @@ if __name__ == "__main__":
         processor = XMLProcessor(
             directory_path=data_directory,
             cache_dir=cache_directory,
-            chunk_size=10 
+            chunk_size=100 
         )
     except FileNotFoundError as e:
         print(f"Error initializing XMLProcessor: {e}")
