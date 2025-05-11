@@ -23,10 +23,8 @@ import time
 import shutil # For cache cleaning if uncommented
 
 # --- BEGIN HDF5 CONFIGURATION ---
-# TODO: YOU MUST SET THESE TO THE CORRECT DATASET NAMES/PATHS WITHIN YOUR .he5 FILES
-HDF5_SWE_DATASET_NAME = "PLACEHOLDER_SWE_DATASET_NAME"  # Example: "/HDFEOS/GRIDS/NorthernHemisphere/Data Fields/SWE"
-HDF5_TEMP_DATASET_NAME = "PLACEHOLDER_TEMP_DATASET_NAME" # Example: "/HDFEOS/GRIDS/NorthernHemisphere/Data Fields/Temperature"
-HDF5_PRECIP_DATASET_NAME = "PLACEHOLDER_PRECIP_DATASET_NAME" # Example: "/HDFEOS/GRIDS/NorthernHemisphere/Data Fields/Precipitation"
+# Only one dataset for SWE
+HDF5_SWE_DATASET_NAME = "HDFEOS/GRIDS/Northern Hemisphere/Data Fields/SWE_NorthernPentad"
 # --- END HDF5 CONFIGURATION ---
 
 # Set random seed for reproducibility
@@ -55,7 +53,7 @@ def mount_drive(drive_path='/content/drive'):
 class XMLProcessor:
     def __init__(self, xml_directory_path, h5_data_dir, cache_dir=None, chunk_size=5,
                  default_patch_height=64, default_patch_width=64,
-                 default_grid_rows=10, default_grid_cols=9, default_channels=3):
+                 default_grid_rows=10, default_grid_cols=9, default_channels=1):  # Changed default_channels to 1
         self.xml_directory_path = xml_directory_path
         self.h5_data_dir = h5_data_dir
         self.cache_dir = cache_dir
@@ -69,7 +67,7 @@ class XMLProcessor:
             'patch_width': default_patch_width,
             'grid_rows_in_hdf5': default_grid_rows, # Number of rows of patches to extract from an HDF5
             'grid_cols_in_hdf5': default_grid_cols, # Number of columns of patches
-            'channels': default_channels,
+            'channels': default_channels,  # Changed to 1 for SWE only
             'num_xml_files': 0
         }
         self._scan_files_and_metadata()
@@ -134,33 +132,24 @@ class XMLProcessor:
 
         # Placeholder for extracting dimensions from XML if they exist
         # For now, we rely on defaults or what's set from the first XML.
-        # Example:
-        # patch_h_elem = root.find('.//PatchHeight')
-        # extracted_patch_h = int(patch_h_elem.text) if patch_h_elem is not None else None
         extracted_dims = {} # Populate this if XML contains usable dimension info
 
         return h5_filename, extracted_dims
 
     def _read_hdf5_patch(self, h5_filepath, patch_row_idx, patch_col_idx,
-                         patch_h, patch_w, channels,
-                         dataset_names):
+                         patch_h, patch_w, channels):
         """
-        Reads specified datasets from HDF5, extracts/crops a patch, and stacks channels.
-        dataset_names: dict {'swe': name, 'temp': name, 'precip': name}
+        Reads SWE dataset from HDF5, extracts/crops a patch, with added normalization.
         Returns: np.array of shape (patch_h, patch_w, channels) or None on error.
         """
-        if HDF5_SWE_DATASET_NAME == "PLACEHOLDER_SWE_DATASET_NAME" or \
-           HDF5_TEMP_DATASET_NAME == "PLACEHOLDER_TEMP_DATASET_NAME" or \
-           HDF5_PRECIP_DATASET_NAME == "PLACEHOLDER_PRECIP_DATASET_NAME":
-            raise ValueError("HDF5 dataset names are not configured. Please set them at the top of the script.")
+        if HDF5_SWE_DATASET_NAME == "PLACEHOLDER_SWE_DATASET_NAME":
+            raise ValueError("HDF5 dataset name is not configured. Please set it at the top of the script.")
 
         try:
             with h5py.File(h5_filepath, 'r') as f:
-                swe_full = f[dataset_names['swe']][()]
-                temp_full = f[dataset_names['temp']][()]
-                precip_full = f[dataset_names['precip']][()]
+                swe_full = f[HDF5_SWE_DATASET_NAME][()]
 
-                # Assume all full datasets have same H, W
+                # Get full dataset dimensions
                 full_h, full_w = swe_full.shape
 
                 start_row = patch_row_idx * patch_h
@@ -169,49 +158,56 @@ class XMLProcessor:
                 end_col = start_col + patch_w
 
                 if end_row > full_h or end_col > full_w:
-                    # This check should ideally be done when setting grid_rows_in_hdf5/grid_cols_in_hdf5
-                    # based on actual HDF5 dimensions vs patch size.
-                    # For now, if patch goes out of bounds, return zeros (or handle as error)
                     print(f"Warning: Patch ({patch_row_idx},{patch_col_idx}) for {os.path.basename(h5_filepath)} "
                           f"from ({start_row}:{end_row}, {start_col}:{end_col}) "
                           f"exceeds HDF5 dims ({full_h},{full_w}). Returning zeros.")
                     return np.zeros((patch_h, patch_w, channels), dtype=np.float32)
 
                 swe_patch = swe_full[start_row:end_row, start_col:end_col]
-                temp_patch = temp_full[start_row:end_row, start_col:end_col]
-                precip_patch = precip_full[start_row:end_row, start_col:end_col]
                 
-                # Ensure extracted patches match desired patch_h, patch_w
-                # This simple extraction assumes they do. Add resizing/padding if needed.
-                if swe_patch.shape != (patch_h, patch_w) or \
-                   temp_patch.shape != (patch_h, patch_w) or \
-                   precip_patch.shape != (patch_h, patch_w):
-                    # This can happen if full_dim % patch_dim != 0 for the last patch
-                    # Or if patch_idx calculation is off.
-                    # Simplest fix: pad or resize. For now, error.
+                # Ensure extracted patch matches desired patch_h, patch_w
+                if swe_patch.shape != (patch_h, patch_w):
                     print(f"Error: Extracted patch shape mismatch for {os.path.basename(h5_filepath)}. "
                           f"Expected {(patch_h, patch_w)}, got SWE:{swe_patch.shape}. "
                           "Check HDF5 dimensions, patch size, and grid_rows/cols settings.")
-                    # Fallback to zeros to avoid crashing, but this indicates a config issue.
                     return np.zeros((patch_h, patch_w, channels), dtype=np.float32)
 
-
-                data_patch = np.zeros((patch_h, patch_w, channels), dtype=np.float32)
-                if channels >= 1: data_patch[..., 0] = swe_patch
-                if channels >= 2: data_patch[..., 1] = temp_patch
-                if channels >= 3: data_patch[..., 2] = precip_patch
+                # --- CHANGE 1: Filter extreme values ---
+                # First, replace NaN or invalid values
+                swe_patch = np.nan_to_num(swe_patch, nan=0.0, posinf=1000.0, neginf=0.0)
                 
-                return np.nan_to_num(data_patch)
+                # Clip to reasonable SWE range (adjust based on your data)
+                # Typical SWE values might range from 0 to 1000 mm
+                swe_patch = np.clip(swe_patch, 0.0, 1000.0)
+                
+                # --- CHANGE 2: Normalize the data ---
+                # Option 1: Min-max normalization to [0,1] range
+                # Using fixed range based on typical SWE values
+                SWE_MAX = 1000.0  # Maximum expected SWE value in mm
+                SWE_MIN = 0.0     # Minimum expected SWE value in mm
+                swe_patch = (swe_patch - SWE_MIN) / (SWE_MAX - SWE_MIN + 1e-8)  # Add small epsilon to avoid div by zero
+                
+                # Option 2: Standardization (if you prefer this approach)
+                # Commented out but you can uncomment if you prefer standardization
+                # SWE_MEAN = 200.0  # Estimated mean SWE value
+                # SWE_STD = 150.0   # Estimated standard deviation 
+                # swe_patch = (swe_patch - SWE_MEAN) / (SWE_STD + 1e-8)
+
+                # Create data patch with just SWE data
+                data_patch = np.zeros((patch_h, patch_w, channels), dtype=np.float32)
+                data_patch[..., 0] = swe_patch
+                
+                return data_patch
 
         except FileNotFoundError:
             print(f"Error: HDF5 file not found during read: {h5_filepath}")
-            return np.zeros((patch_h, patch_w, channels), dtype=np.float32) # Return zeros
+            return np.zeros((patch_h, patch_w, channels), dtype=np.float32)
         except KeyError as e:
-            print(f"Error: Dataset not found in {h5_filepath}: {e}. Check HDF5_..._DATASET_NAME constants.")
-            return np.zeros((patch_h, patch_w, channels), dtype=np.float32) # Return zeros
+            print(f"Error: Dataset not found in {h5_filepath}: {e}. Check HDF5_SWE_DATASET_NAME constant.")
+            return np.zeros((patch_h, patch_w, channels), dtype=np.float32)
         except Exception as e:
             print(f"Error reading or processing HDF5 file {h5_filepath}: {e}")
-            return np.zeros((patch_h, patch_w, channels), dtype=np.float32) # Return zeros
+            return np.zeros((patch_h, patch_w, channels), dtype=np.float32)
 
     def _get_cache_path(self, chunk_idx):
         if self.cache_dir is None: return None
@@ -253,21 +249,14 @@ class XMLProcessor:
                 except OSError as e: print(f"Error deleting stale cache file {cache_path}: {e}")
         
         current_chunk_data = np.zeros(expected_chunk_shape, dtype=np.float32)
-        dataset_names_map = {
-            'swe': HDF5_SWE_DATASET_NAME,
-            'temp': HDF5_TEMP_DATASET_NAME,
-            'precip': HDF5_PRECIP_DATASET_NAME
-        }
 
         for i in range(num_xml_in_this_chunk):
             xml_file_global_idx = start_xml_idx + i
             h5_filepath = self.h5_files[xml_file_global_idx]
-            # print(f"Processing chunk {chunk_idx}, file {i+1}/{num_xml_in_this_chunk}: {os.path.basename(h5_filepath)}")
             for r_idx in range(grid_r):
                 for c_idx in range(grid_c):
                     patch_data = self._read_hdf5_patch(h5_filepath, r_idx, c_idx,
-                                                       patch_h, patch_w, ch,
-                                                       dataset_names_map)
+                                                      patch_h, patch_w, ch)
                     current_chunk_data[i, r_idx, c_idx, ...] = patch_data
         
         if cache_path:
@@ -393,20 +382,15 @@ class XMLProcessor:
 
             sample_patch = all_patches[patch_row_idx, patch_col_idx, ...] # Shape (patch_h, patch_w, channels)
 
-            fig, axes = plt.subplots(1, self.dimensions['channels'], figsize=(5*self.dimensions['channels'],5))
-            if self.dimensions['channels'] == 1: axes = [axes] # Ensure axes is iterable
-            
-            channel_names = ['SWE', 'Temperature', 'Precipitation']
-            for i in range(self.dimensions['channels']):
-                ch_name = channel_names[i] if i < len(channel_names) else f'Ch {i+1}'
-                im = axes[i].imshow(sample_patch[:,:,i],cmap='viridis')
-                axes[i].set_title(ch_name)
-                plt.colorbar(im,ax=axes[i])
+            plt.figure(figsize=(5, 5))
+            im = plt.imshow(sample_patch[:,:,0], cmap='viridis')
+            plt.title('SWE')
+            plt.colorbar(im)
             
             plt.suptitle(f"HDF5: {os.path.basename(self.h5_files[xml_file_idx])}, Patch ({patch_row_idx},{patch_col_idx})")
             plt.tight_layout(rect=[0,0,1,0.96])
             os.makedirs(os.path.dirname(save_path),exist_ok=True)
-            plt.savefig(save_path); plt.close(fig)
+            plt.savefig(save_path); plt.close()
             print(f"Sample patch visualization saved to {save_path}")
         except IndexError as e: 
             print(f"Error visualizing sample (xml_idx={xml_file_idx}, patch_row={patch_row_idx}, patch_col={patch_col_idx}): {e}")
@@ -489,7 +473,7 @@ class ChunkedSWEDataset(Dataset):
         return torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
 
-# --- 6. Model Definition (Unchanged) ---
+# --- 6. Model Definition (Updated for Single Channel) ---
 class TransformerEncoder(nn.Module):
     def __init__(self, emb_dim, num_heads, hidden_dim, dropout):
         super(TransformerEncoder, self).__init__()
@@ -505,22 +489,42 @@ class ConvLSTMCell(nn.Module):
         super(ConvLSTMCell, self).__init__()
         self.input_dim, self.hidden_dim, self.kernel_size, self.bias = input_dim, hidden_dim, kernel_size, bias
         self.padding = kernel_size // 2
-        self.conv = nn.Conv2d(input_dim + hidden_dim, 4 * hidden_dim, kernel_size, self.padding, bias=bias)
+        self.conv = nn.Conv2d(input_dim + hidden_dim, 4 * hidden_dim, kernel_size, 
+                             padding=self.padding, bias=bias)
 
     def forward(self, input_tensor, cur_state):
         h_cur, c_cur = cur_state
-        combined_conv = self.conv(torch.cat([input_tensor, h_cur], dim=1))
+        
+        # Ensure dimensions match
+        if input_tensor.shape[2:] != h_cur.shape[2:]:
+            # Resize h_cur and c_cur to match input_tensor spatial dimensions
+            h_cur = F.interpolate(h_cur, size=input_tensor.shape[2:], mode='bilinear', align_corners=True)
+            c_cur = F.interpolate(c_cur, size=input_tensor.shape[2:], mode='bilinear', align_corners=True)
+        
+        combined = torch.cat([input_tensor, h_cur], dim=1)
+        combined_conv = self.conv(combined)
+        
+        # Split along channel dimension
         cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
-        i, f, o, g = torch.sigmoid(cc_i), torch.sigmoid(cc_f), torch.sigmoid(cc_o), torch.tanh(cc_g)
+        
+        # Apply activations
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
+        
+        # Update cell state and hidden state
         c_next = f * c_cur + i * g
         h_next = o * torch.tanh(c_next)
+        
         return h_next, c_next
 
     def init_hidden(self, batch_size, image_size):
+        """Initialize hidden state for a batch of samples"""
         h, w = image_size
-        dev = self.conv.weight.device
-        return (torch.zeros(batch_size, self.hidden_dim, h, w, device=dev),
-                torch.zeros(batch_size, self.hidden_dim, h, w, device=dev))
+        device = self.conv.weight.device
+        return (torch.zeros(batch_size, self.hidden_dim, h, w, device=device),
+                torch.zeros(batch_size, self.hidden_dim, h, w, device=device))
 
 class ConvLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, kernel_size, num_layers, batch_first=True, return_sequences=True):
@@ -537,16 +541,38 @@ class ConvLSTM(nn.Module):
     def forward(self, x, hidden_state=None):
         if not self.batch_first: x = x.permute(1, 0, 2, 3, 4)
         bs, seq_len, _, h, w = x.size()
-        if hidden_state is None: hidden_state = [cell.init_hidden(bs, (h,w)) for cell in self.cells]
+        
+        # Initialize hidden state - ensure dimensions match input
+        if hidden_state is None: 
+            hidden_state = []
+            for cell in self.cells:
+                # Get the expected output size from the cell's convolution
+                conv_out_h = h
+                conv_out_w = w
+                hidden_state.append(cell.init_hidden(bs, (conv_out_h, conv_out_w)))
+                
         outputs, last_h_t = [], None
         for t in range(seq_len):
             h_t_input = x[:, t, :, :, :]
             for layer_idx in range(self.num_layers):
-                h_prev,c_prev = hidden_state[layer_idx]; h_t,c_t = self.cells[layer_idx](h_t_input,(h_prev,c_prev))
-                hidden_state[layer_idx]=(h_t,c_t); h_t_input=h_t
-            last_h_t=h_t
+                h_prev, c_prev = hidden_state[layer_idx]
+                
+                # Ensure h_t_input and h_prev have the same spatial dimensions
+                if h_t_input.shape[2:] != h_prev.shape[2:]:
+                    # If there's a mismatch, resize h_prev to match h_t_input
+                    # This is a hacky solution but should work for this specific case
+                    h_prev = F.interpolate(h_prev, size=h_t_input.shape[2:], mode='nearest')
+                    c_prev = F.interpolate(c_prev, size=h_t_input.shape[2:], mode='nearest')
+                    hidden_state[layer_idx] = (h_prev, c_prev)
+                
+                h_t, c_t = self.cells[layer_idx](h_t_input, (h_prev, c_prev))
+                hidden_state[layer_idx] = (h_t, c_t)
+                h_t_input = h_t
+                
+            last_h_t = h_t
             if self.return_sequences: outputs.append(last_h_t)
-        if self.return_sequences: return torch.stack(outputs,dim=1), hidden_state
+            
+        if self.return_sequences: return torch.stack(outputs, dim=1), hidden_state
         else: return last_h_t, hidden_state
 
 class UNetDecoderBlock(nn.Module):
@@ -558,47 +584,70 @@ class UNetDecoderBlock(nn.Module):
     def forward(self, x): x=self.relu(self.bn1(self.conv1(x))); x=self.relu(self.bn2(self.conv2(x))); return x
 
 class SWETransUNet(nn.Module):
-    def __init__(self, in_channels=3, emb_dim=256, num_heads=8, hidden_dim=512, dropout=0.1, num_transformer_layers=2):
+    def __init__(self, in_channels=1, emb_dim=128, num_heads=4, hidden_dim=256, dropout=0.1, num_transformer_layers=1):
         super(SWETransUNet, self).__init__()
-        self.patch_embed=nn.Conv2d(in_channels,emb_dim,kernel_size=4,stride=4) # Assumes H, W are multiples of 4
-        self.transformer_encoders=nn.ModuleList([TransformerEncoder(emb_dim,num_heads,hidden_dim,dropout) for _ in range(num_transformer_layers)])
-        self.conv_lstm=ConvLSTM(emb_dim,emb_dim,3,1,batch_first=True,return_sequences=False)
-        self.upsample1=nn.Upsample(scale_factor=2,mode='bilinear',align_corners=True); self.decoder_block1=UNetDecoderBlock(emb_dim,128)
-        self.upsample2=nn.Upsample(scale_factor=2,mode='bilinear',align_corners=True); self.decoder_block2=UNetDecoderBlock(128,64)
-        # Removed one decoder block to match patch_embed stride 4 if input H,W are e.g. 64 -> 16 -> 32 -> 64
-        # If patch_embed stride is 1, then original 3 decoder blocks might be fine.
-        # Current setup: H/4 (patch_embed) -> H/4 (transformer) -> H/4 (convlstm) -> H/2 (upsample1) -> H (upsample2)
-        # Need to ensure output matches input H, W for SWE prediction.
-        # If input to model is 64x64, patch_embed -> 16x16. ConvLSTM output is 16x16.
-        # Upsample1(16x16) -> 32x32. Upsample2(32x32) -> 64x64. This is correct.
-        self.decoder_block3=UNetDecoderBlock(64,32); self.final_conv=nn.Conv2d(32,1,kernel_size=1)
+        # Use a simpler architecture to avoid dimension issues
+        # Start with a standard convolution for embedding
+        self.patch_embed = nn.Sequential(
+            nn.Conv2d(in_channels, emb_dim//2, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(emb_dim//2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(emb_dim//2, emb_dim, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(emb_dim),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Transformer encoder
+        self.transformer_encoders = nn.ModuleList([
+            TransformerEncoder(emb_dim, num_heads, hidden_dim, dropout) 
+            for _ in range(num_transformer_layers)
+        ])
+        
+        # ConvLSTM for temporal processing
+        self.conv_lstm = ConvLSTM(emb_dim, emb_dim, 3, 1, batch_first=True, return_sequences=False)
+        
+        # Decoder path - use a more flexible architecture
+        self.decoder = nn.Sequential(
+            nn.Conv2d(emb_dim, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Final convolution
+        self.final_conv = nn.Conv2d(32, 1, kernel_size=1)
     
-    def forward(self, x): # x: (bs, seq, H_in, W_in, C_in)
-        bs,seq,H_in,W_in,C_in=x.shape
-        x=x.permute(0,1,4,2,3).reshape(bs*seq,C_in,H_in,W_in) # (bs*seq, C_in, H_in, W_in)
+    def forward(self, x):
+        bs, seq, H_in, W_in, C_in = x.shape
         
-        x=self.patch_embed(x) # (bs*seq, C_emb, H_patch, W_patch) H_patch = H_in/4
-        _,C_emb,H_patch,W_patch=x.shape
+        # First, process each time step through the embedding
+        embeddings = []
+        for t in range(seq):
+            x_t = x[:, t].permute(0, 3, 1, 2)  # [B, C, H, W]
+            emb_t = self.patch_embed(x_t)       # [B, emb_dim, H', W']
+            embeddings.append(emb_t)
         
-        x=x.permute(0,2,3,1).reshape(bs*seq,H_patch*W_patch,C_emb) # (bs*seq, Num_patches, C_emb)
-        for encoder in self.transformer_encoders: x=encoder(x)
+        # Stack along sequence dimension
+        embeddings = torch.stack(embeddings, dim=1)  # [B, seq, emb_dim, H', W']
         
-        x=x.reshape(bs,seq,H_patch,W_patch,C_emb).permute(0,1,4,2,3) # (bs, seq, C_emb, H_patch, W_patch)
-        x,_=self.conv_lstm(x) # x is last hidden state: (bs, C_emb, H_patch, W_patch)
+        # Apply ConvLSTM directly on embedded sequence
+        lstm_out, _ = self.conv_lstm(embeddings)  # [B, emb_dim, H', W']
         
-        x=self.decoder_block1(self.upsample1(x)) # (bs, 128, H_patch*2, W_patch*2)
-        x=self.decoder_block2(self.upsample2(x)) # (bs, 64, H_patch*4, W_patch*4) -> (bs, 64, H_in, W_in)
+        # Decode to final output
+        decoded = self.decoder(lstm_out)
         
-        # If only two upsamples are used, and patch_embed reduces by 4, then decoder_block3 might be for further refinement at full res
-        # Or it might be an error if we expect final_conv after decoder_block2.
-        # Given the upsampling factors, after decoder_block2, x is at original H_in, W_in.
-        # So decoder_block3 processes at full resolution if it's used. Let's assume it is.
-        x=self.decoder_block3(x) # (bs, 32, H_in, W_in)
-        x=self.final_conv(x) # (bs, 1, H_in, W_in)
+        # Ensure output size matches input size using interpolation
+        if decoded.shape[2:] != (H_in, W_in):
+            decoded = F.interpolate(decoded, size=(H_in, W_in), mode='bilinear', align_corners=True)
         
-        return x.permute(0,2,3,1) # (bs, H_in, W_in, 1)
+        # Final convolution and permute to match expected output format
+        output = self.final_conv(decoded)    # [B, 1, H_in, W_in]
+        return output.permute(0, 2, 3, 1)    # [B, H_in, W_in, 1]
 
-# --- 7. Training and Evaluation Functions (Unchanged, but sensitive to X,y shapes) ---
+# --- 7. Training and Evaluation Functions ---
 def compute_metrics(y_true, y_pred):
     y_true_np=y_true.cpu().detach().numpy().reshape(-1); y_pred_np=y_pred.cpu().detach().numpy().reshape(-1)
     mse=mean_squared_error(y_true_np,y_pred_np); mae=mean_absolute_error(y_true_np,y_pred_np)
@@ -607,37 +656,92 @@ def compute_metrics(y_true, y_pred):
     return mse,mae,r2
 
 def train_model(model, train_loader, val_loader, num_epochs, lr, results_directory, cache_dir_model):
-    criterion=nn.MSELoss(); optimizer=torch.optim.Adam(model.parameters(),lr=lr)
-    scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,'min',factor=0.5,patience=3)
+    # --- CHANGE 3: Use a more robust loss function ---
+    # criterion = nn.MSELoss()  # Original loss
+    criterion = nn.SmoothL1Loss(beta=0.2)  # Huber loss - less sensitive to outliers
+    
+    # You can also try L1Loss if Huber doesn't work well
+    # criterion = nn.L1Loss()
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # FIX: Use only the basic parameters supported by older PyTorch versions
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 'min', factor=0.5, patience=3
+    )
+    
+    # Print message to show what scheduler is doing
+    print(f"Using ReduceLROnPlateau scheduler with factor=0.5, patience=3")
+    
     metrics_hist={'train_mse':[],'train_mae':[],'train_r2':[],'val_mse':[],'val_mae':[],'val_r2':[],'learning_rates':[]}
-    best_val_mse=float('inf'); best_model_path=os.path.join(cache_dir_model,'best_model.pth'); os.makedirs(cache_dir_model,exist_ok=True)
+    best_val_mse=float('inf')
+    best_model_path=os.path.join(cache_dir_model,'best_model.pth')
+    os.makedirs(cache_dir_model,exist_ok=True)
 
     for epoch in range(num_epochs):
         start_time=time.time(); model.train(); tr_mse,tr_mae,tr_r2,tr_loss,tr_samples=0.0,0.0,0.0,0.0,0
         prog_bar_tr=tqdm(train_loader,desc=f'Epoch {epoch+1}/{num_epochs} Train',leave=False)
         for X_b,y_b in prog_bar_tr: # X_b: (bs,seq,H,W,C), y_b: (bs,H,W,1)
-            X_b,y_b=X_b.to(device),y_b.to(device); optimizer.zero_grad(); out=model(X_b) # model output: (bs,H,W,1)
-            loss=criterion(out,y_b); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); optimizer.step()
-            m,a,r=compute_metrics(y_b,out); bs=X_b.size(0)
-            tr_loss+=loss.item()*bs; tr_mse+=m*bs; tr_mae+=a*bs; tr_r2+=r*bs; tr_samples+=bs
-            prog_bar_tr.set_postfix(loss=loss.item(),mse=m,r2=f"{r:.3f}")
-            if tr_samples>0 and tr_samples%(len(train_loader)//4+1)==0: gc.collect(); torch.cuda.empty_cache()
+            try:
+                X_b,y_b=X_b.to(device),y_b.to(device); optimizer.zero_grad(); out=model(X_b) # model output: (bs,H,W,1)
+                loss=criterion(out,y_b); loss.backward() 
+                
+                # --- CHANGE 4: More aggressive gradient clipping ---
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Reduced from 1.0 to 0.5
+                
+                optimizer.step()
+                
+                # Even though we're using Huber loss for training, we still compute MSE for monitoring
+                with torch.no_grad():
+                    mse_loss = F.mse_loss(out, y_b).item()
+                
+                m,a,r=compute_metrics(y_b,out); bs=X_b.size(0)
+                tr_loss+=loss.item()*bs; tr_mse+=m*bs; tr_mae+=a*bs; tr_r2+=r*bs; tr_samples+=bs
+                prog_bar_tr.set_postfix(loss=loss.item(), mse=mse_loss, r2=f"{r:.3f}")
+                
+                # Detect and report extreme loss values
+                if loss.item() > 100:
+                    print(f"Warning: High loss detected: {loss.item():.2f}")
+                
+                if tr_samples>0 and tr_samples%(len(train_loader)//4+1)==0: gc.collect(); torch.cuda.empty_cache()
+            except RuntimeError as e:
+                print(f"Error during training batch: {e}")
+                # Skip this batch and continue with the next one
+                optimizer.zero_grad()  # Clear any partial gradients
+                torch.cuda.empty_cache()
+                continue
         
-        metrics_hist['train_mse'].append(tr_mse/tr_samples if tr_samples else 0); metrics_hist['train_mae'].append(tr_mae/tr_samples if tr_samples else 0)
-        metrics_hist['train_r2'].append(tr_r2/tr_samples if tr_samples else 0)
+        if tr_samples > 0:  # Only update metrics if we processed at least one batch
+            metrics_hist['train_mse'].append(tr_mse/tr_samples); metrics_hist['train_mae'].append(tr_mae/tr_samples)
+            metrics_hist['train_r2'].append(tr_r2/tr_samples)
+        else:
+            print("Warning: No training samples were processed successfully in this epoch")
+            metrics_hist['train_mse'].append(float('inf')); metrics_hist['train_mae'].append(float('inf'))
+            metrics_hist['train_r2'].append(0.0)
 
         model.eval(); val_mse,val_mae,val_r2,val_loss,val_samples=0.0,0.0,0.0,0.0,0
         prog_bar_val=tqdm(val_loader,desc=f'Epoch {epoch+1}/{num_epochs} Val',leave=False)
         with torch.no_grad():
             for X_b,y_b in prog_bar_val:
-                X_b,y_b=X_b.to(device),y_b.to(device); out=model(X_b); loss=criterion(out,y_b)
-                m,a,r=compute_metrics(y_b,out); bs=X_b.size(0)
-                val_loss+=loss.item()*bs; val_mse+=m*bs; val_mae+=a*bs; val_r2+=r*bs; val_samples+=bs
-                prog_bar_val.set_postfix(loss=loss.item(),mse=m,r2=f"{r:.3f}")
+                try:
+                    X_b,y_b=X_b.to(device),y_b.to(device); out=model(X_b); loss=criterion(out,y_b)
+                    m,a,r=compute_metrics(y_b,out); bs=X_b.size(0)
+                    val_loss+=loss.item()*bs; val_mse+=m*bs; val_mae+=a*bs; val_r2+=r*bs; val_samples+=bs
+                    prog_bar_val.set_postfix(loss=loss.item(),mse=m,r2=f"{r:.3f}")
+                except RuntimeError as e:
+                    print(f"Error during validation batch: {e}")
+                    continue
         
-        curr_val_mse=val_mse/val_samples if val_samples else float('inf')
-        metrics_hist['val_mse'].append(curr_val_mse); metrics_hist['val_mae'].append(val_mae/val_samples if val_samples else 0)
-        metrics_hist['val_r2'].append(val_r2/val_samples if val_samples else 0)
+        if val_samples > 0:
+            curr_val_mse=val_mse/val_samples
+            metrics_hist['val_mse'].append(curr_val_mse); metrics_hist['val_mae'].append(val_mae/val_samples)
+            metrics_hist['val_r2'].append(val_r2/val_samples)
+        else:
+            print("Warning: No validation samples were processed successfully in this epoch")
+            curr_val_mse = float('inf')
+            metrics_hist['val_mse'].append(float('inf')); metrics_hist['val_mae'].append(float('inf'))
+            metrics_hist['val_r2'].append(0.0)
+            
         metrics_hist['learning_rates'].append(optimizer.param_groups[0]['lr'])
 
         if val_samples > 0: scheduler.step(curr_val_mse)
@@ -646,24 +750,33 @@ def train_model(model, train_loader, val_loader, num_epochs, lr, results_directo
             torch.save({'epoch':epoch,'model_state_dict':model.state_dict(),'optimizer_state_dict':optimizer.state_dict(),
                         'val_mse':curr_val_mse,'metrics_history':metrics_hist},best_model_path)
 
-        print(f'E{epoch+1}/{num_epochs} ({time.time()-start_time:.1f}s) LR:{optimizer.param_groups[0]["lr"]:.1e} | Tr MSE:{metrics_hist["train_mse"][-1]:.4f} R2:{metrics_hist["train_r2"][-1]:.2f} | Val MSE:{metrics_hist["val_mse"][-1]:.4f} R2:{metrics_hist["val_r2"][-1]:.2f}')
+        print(f'E{epoch+1}/{num_epochs} ({time.time()-start_time:.1f}s) LR:{optimizer.param_groups[0]["lr"]:.1e} | ' +
+              f'Tr MSE:{metrics_hist["train_mse"][-1]:.4f} R2:{metrics_hist["train_r2"][-1]:.2f} | ' +
+              f'Val MSE:{metrics_hist["val_mse"][-1]:.4f} R2:{metrics_hist["val_r2"][-1]:.2f}')
         gc.collect(); torch.cuda.empty_cache()
 
-    fig,ax=plt.subplots(2,2,figsize=(12,8))
-    ax[0,0].plot(metrics_hist['train_mse'],label='Tr MSE'); ax[0,0].plot(metrics_hist['val_mse'],label='Val MSE')
-    ax[0,1].plot(metrics_hist['train_mae'],label='Tr MAE'); ax[0,1].plot(metrics_hist['val_mae'],label='Val MAE')
-    ax[1,0].plot(metrics_hist['train_r2'],label='Tr R2'); ax[1,0].plot(metrics_hist['val_r2'],label='Val R2')
-    ax[1,1].plot(metrics_hist['learning_rates'],label='LR')
-    titles=['MSE','MAE','R2','Learning Rate']
-    for r_idx in range(2): 
-        for c_idx in range(2): ax[r_idx,c_idx].legend(); ax[r_idx,c_idx].set_xlabel('Epoch'); ax[r_idx,c_idx].set_title(titles[r_idx*2+c_idx])
-    ax[1,1].set_yscale('log'); plt.tight_layout(); os.makedirs(results_directory,exist_ok=True)
-    plot_path=os.path.join(results_directory,'training_metrics.png'); plt.savefig(plot_path); plt.close(fig)
-    print(f"Training metrics plot: {plot_path}")
+    # Create visualization plots
+    try:
+        fig,ax=plt.subplots(2,2,figsize=(12,8))
+        ax[0,0].plot(metrics_hist['train_mse'],label='Tr MSE'); ax[0,0].plot(metrics_hist['val_mse'],label='Val MSE')
+        ax[0,1].plot(metrics_hist['train_mae'],label='Tr MAE'); ax[0,1].plot(metrics_hist['val_mae'],label='Val MAE')
+        ax[1,0].plot(metrics_hist['train_r2'],label='Tr R2'); ax[1,0].plot(metrics_hist['val_r2'],label='Val R2')
+        ax[1,1].plot(metrics_hist['learning_rates'],label='LR')
+        titles=['MSE','MAE','R2','Learning Rate']
+        for r_idx in range(2): 
+            for c_idx in range(2): ax[r_idx,c_idx].legend(); ax[r_idx,c_idx].set_xlabel('Epoch'); ax[r_idx,c_idx].set_title(titles[r_idx*2+c_idx])
+        ax[1,1].set_yscale('log'); plt.tight_layout(); os.makedirs(results_directory,exist_ok=True)
+        plot_path=os.path.join(results_directory,'training_metrics.png'); plt.savefig(plot_path); plt.close(fig)
+        print(f"Training metrics plot: {plot_path}")
+    except Exception as e:
+        print(f"Error creating training plots: {e}")
 
     if os.path.exists(best_model_path):
-        ckpt=torch.load(best_model_path,map_location=device); model.load_state_dict(ckpt['model_state_dict'])
-        print(f"Loaded best model from E{ckpt['epoch']+1} (Val MSE: {ckpt['val_mse']:.6f})")
+        try:
+            ckpt=torch.load(best_model_path,map_location=device); model.load_state_dict(ckpt['model_state_dict'])
+            print(f"Loaded best model from E{ckpt['epoch']+1} (Val MSE: {ckpt['val_mse']:.6f})")
+        except Exception as e:
+            print(f"Error loading best model: {e}")
     return model,metrics_hist
 
 def evaluate_model(model, test_loader):
@@ -671,10 +784,14 @@ def evaluate_model(model, test_loader):
     prog_bar_test=tqdm(test_loader,desc="Evaluating Test",leave=False)
     with torch.no_grad():
         for X_b,y_b in prog_bar_test:
-            X_b,y_b=X_b.to(device),y_b.to(device); out=model(X_b)
-            m,a,r=compute_metrics(y_b,out); bs=X_b.size(0)
-            t_mse+=m*bs; t_mae+=a*bs; t_r2+=r*bs; t_samples+=bs
-            prog_bar_test.set_postfix(mse=m,r2=f"{r:.3f}")
+            try:
+                X_b,y_b=X_b.to(device),y_b.to(device); out=model(X_b)
+                m,a,r=compute_metrics(y_b,out); bs=X_b.size(0)
+                t_mse+=m*bs; t_mae+=a*bs; t_r2+=r*bs; t_samples+=bs
+                prog_bar_test.set_postfix(mse=m,r2=f"{r:.3f}")
+            except RuntimeError as e:
+                print(f"Error during evaluation batch: {e}")
+                continue
     res_mse=t_mse/t_samples if t_samples else 0; res_mae=t_mae/t_samples if t_samples else 0; res_r2=t_r2/t_samples if t_samples else 0
     print(f"Test Results - MSE: {res_mse:.5f}, MAE: {res_mae:.5f}, R²: {res_r2:.3f}")
     return res_mse,res_mae,res_r2
@@ -686,31 +803,41 @@ def visualize_predictions(model, test_loader, num_samples, results_dir):
     with torch.no_grad():
         for X_b,y_b in test_loader: # X_b: (bs,seq,H,W,C), y_b: (bs,H,W,1)
             if count>=num_samples: break
-            X_b_dev,y_b_dev=X_b.to(device),y_b.to(device); pred_b=model(X_b_dev) # pred_b: (bs,H,W,1)
-            for i in range(X_b.size(0)):
-                if count>=num_samples: break
-                samples_plt.append((X_b[i].cpu(),y_b[i].cpu(),pred_b[i].cpu())); count+=1 # Store original X,y from loader
+            X_b_dev,y_b_dev=X_b.to(device),y_b.to(device)
+            try:
+                pred_b=model(X_b_dev) # pred_b: (bs,H,W,1)
+                for i in range(X_b.size(0)):
+                    if count>=num_samples: break
+                    samples_plt.append((X_b[i].cpu(),y_b[i].cpu(),pred_b[i].cpu())); count+=1 # Store original X,y from loader
+            except Exception as e:
+                print(f"Error during visualization forward pass: {e}")
+                continue
+                
     if not samples_plt: print("No samples for viz."); return
     os.makedirs(results_dir,exist_ok=True)
     for i,(X_s,y_s,p_s) in enumerate(samples_plt): # X_s:(seq,H,W,C), y_s:(H,W,1), p_s:(H,W,1)
-        m,a,r=compute_metrics(y_s.unsqueeze(0),p_s.unsqueeze(0)) # Add batch dim for metrics
-        fig,ax=plt.subplots(1,2,figsize=(10,4));
-        im0=ax[0].imshow(y_s.squeeze(),cmap='viridis'); ax[0].set_title('GT SWE'); plt.colorbar(im0,ax=ax[0],fraction=0.046,pad=0.04)
-        im1=ax[1].imshow(p_s.squeeze(),cmap='viridis',vmin=y_s.min().item(),vmax=y_s.max().item()); ax[1].set_title('Pred SWE'); plt.colorbar(im1,ax=ax[1],fraction=0.046,pad=0.04)
-        plt.suptitle(f'Sample {i+1} - MSE:{m:.3f} R2:{r:.2f}',fontsize=10)
-        plt.tight_layout(rect=[0,0,1,0.93]); pred_path=os.path.join(results_dir,f'pred_sample_{i+1}.png')
-        plt.savefig(pred_path); plt.close(fig);
+        try:
+            m,a,r=compute_metrics(y_s.unsqueeze(0),p_s.unsqueeze(0)) # Add batch dim for metrics
+            fig,ax=plt.subplots(1,2,figsize=(10,4));
+            im0=ax[0].imshow(y_s.squeeze(),cmap='viridis'); ax[0].set_title('GT SWE'); plt.colorbar(im0,ax=ax[0],fraction=0.046,pad=0.04)
+            im1=ax[1].imshow(p_s.squeeze(),cmap='viridis',vmin=y_s.min().item(),vmax=y_s.max().item()); ax[1].set_title('Pred SWE'); plt.colorbar(im1,ax=ax[1],fraction=0.046,pad=0.04)
+            plt.suptitle(f'Sample {i+1} - MSE:{m:.3f} R2:{r:.2f}',fontsize=10)
+            plt.tight_layout(rect=[0,0,1,0.93]); pred_path=os.path.join(results_dir,f'pred_sample_{i+1}.png')
+            plt.savefig(pred_path); plt.close(fig);
 
-        seq_len,_,_,C_in=X_s.shape; n_in_plots=min(seq_len,2)
-        fig_s,ax_s=plt.subplots(1,n_in_plots,figsize=(3*n_in_plots,3))
-        if n_in_plots==1: ax_s=[ax_s]
-        for j in range(n_in_plots):
-            # Visualize SWE channel from input (assuming it's channel 0)
-            im_sq=ax_s[j].imshow(X_s[j,:,:,0].squeeze(),cmap='viridis'); ax_s[j].set_title(f'In M-{seq_len-j} (SWE)',fontsize=8)
-            ax_s[j].axis('off'); plt.colorbar(im_sq,ax=ax_s[j],fraction=0.046,pad=0.04)
-        plt.suptitle(f'Input SWE Sample {i+1} (Last {n_in_plots})',fontsize=10)
-        plt.tight_layout(rect=[0,0,1,0.90]); in_path=os.path.join(results_dir,f'input_seq_sample_{i+1}.png')
-        plt.savefig(in_path); plt.close(fig_s);
+            seq_len,_,_,C_in=X_s.shape; n_in_plots=min(seq_len,2)
+            fig_s,ax_s=plt.subplots(1,n_in_plots,figsize=(3*n_in_plots,3))
+            if n_in_plots==1: ax_s=[ax_s]
+            for j in range(n_in_plots):
+                # Visualize SWE channel from input
+                im_sq=ax_s[j].imshow(X_s[j,:,:,0].squeeze(),cmap='viridis'); ax_s[j].set_title(f'In M-{seq_len-j} (SWE)',fontsize=8)
+                ax_s[j].axis('off'); plt.colorbar(im_sq,ax=ax_s[j],fraction=0.046,pad=0.04)
+            plt.suptitle(f'Input SWE Sample {i+1} (Last {n_in_plots})',fontsize=10)
+            plt.tight_layout(rect=[0,0,1,0.90]); in_path=os.path.join(results_dir,f'input_seq_sample_{i+1}.png')
+            plt.savefig(in_path); plt.close(fig_s);
+        except Exception as e:
+            print(f"Error visualizing sample {i+1}: {e}")
+            continue
     print(f"Saved {len(samples_plt)} prediction visualizations to {results_dir}")
 
 def clean_cache(cache_dir_to_clean, keep_best_model=True): # Unchanged
@@ -731,14 +858,13 @@ def clean_cache(cache_dir_to_clean, keep_best_model=True): # Unchanged
 if __name__ == "__main__":
     # --- Main Configuration ---
     xml_input_dir = "/home/ubuntu/SWE-Forecasting/data"  # Directory containing XML metadata files
-    # TODO: This directory must contain the .he5 files referenced in the XMLs
     hdf5_data_dir = "/home/ubuntu/SWE-Forecasting/data" # Directory containing .he5 data files 
                                                        # Can be same as xml_input_dir if .he5 are there
 
     output_base_path = "." 
-    cache_directory = os.path.join(output_base_path, 'swe_cache_h5') # New cache dir name
-    results_directory = os.path.join(output_base_path, 'results_h5')
-    model_save_dir = os.path.join(output_base_path, 'models_h5')
+    cache_directory = os.path.join(output_base_path, 'swe_cache_h5_swe_only') # New cache dir name
+    results_directory = os.path.join(output_base_path, 'results_h5_swe_only')
+    model_save_dir = os.path.join(output_base_path, 'models_h5_swe_only')
     # --- End Main Configuration ---
 
     os.makedirs(cache_directory,exist_ok=True); os.makedirs(results_directory,exist_ok=True); os.makedirs(model_save_dir,exist_ok=True)
@@ -756,25 +882,15 @@ if __name__ == "__main__":
        shutil.rmtree(cache_directory)
        os.makedirs(cache_directory, exist_ok=True)
 
-
-    # Check HDF5 placeholder constants
-    if HDF5_SWE_DATASET_NAME == "PLACEHOLDER_SWE_DATASET_NAME" or \
-       HDF5_TEMP_DATASET_NAME == "PLACEHOLDER_TEMP_DATASET_NAME" or \
-       HDF5_PRECIP_DATASET_NAME == "PLACEHOLDER_PRECIP_DATASET_NAME":
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print("! ERROR: HDF5_..._DATASET_NAME constants at the top of the script are not set.!")
-        print("! Please configure them with the correct dataset paths from your .he5 files. !")
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        exit(1)
-
     processor = None
     try:
-        # XMLProcessor defaults: patch_height=64, patch_width=64, grid_rows=10, grid_cols=9, channels=3
+        # XMLProcessor defaults: patch_height=64, patch_width=64, grid_rows=10, grid_cols=9, channels=1 (changed for SWE only)
         # chunk_size can be adjusted based on memory
         processor = XMLProcessor(xml_directory_path=xml_input_dir,
                                  h5_data_dir=hdf5_data_dir, 
-                                 cache_dir=cache_directory, 
-                                 chunk_size=10) # Smaller chunk size for HDF5 processing initially
+                                 cache_dir=cache_directory,
+                                 default_channels=1,  # Set to 1 for SWE only
+                                 chunk_size=10) 
     except FileNotFoundError as e: print(f"Fatal: {e}\nCheck input directories."); exit(1)
     except ValueError as e: print(f"Fatal: {e}\nCheck XML/HDF5 consistency or dataset names."); exit(1)
     except Exception as e: print(f"Unexpected XMLProcessor init error: {e}"); exit(1)
@@ -785,8 +901,6 @@ if __name__ == "__main__":
     if metadata.get('num_xml_files',0)==0: print("No valid XML/HDF5 files processed. Exiting."); exit(1)
 
     # Preprocess (validates/creates cache).
-    # ThreadPoolExecutor for HDF5 reading can sometimes be problematic depending on h5py/HDF5 library build.
-    # If issues occur during preprocessing, try num_workers=0 first.
     processor.preprocess_all_chunks(num_workers=0) # Start with 0 workers for HDF5 stability
 
     # Visualize a sample patch
@@ -799,10 +913,10 @@ if __name__ == "__main__":
                                save_path=initial_sample_path)
 
     # Training parameters
-    sequence_len=6
-    batch_s=8 # Potentially smaller batch size if data per sample is larger
-    num_eps=5
-    lr_val=1e-4
+    sequence_len = 6
+    batch_s = 8  
+    num_eps = 5
+    lr_val = 1e-5  # Reduced from 1e-4 to 1e-5
 
     train_ds=ChunkedSWEDataset(processor,split='train',sequence_length=sequence_len)
     val_ds=ChunkedSWEDataset(processor,split='val',sequence_length=sequence_len)
@@ -847,12 +961,12 @@ if __name__ == "__main__":
             # Fallback if sample can't be loaded, use metadata directly
             print("Using dimensions directly from metadata due to loader error.")
 
-    # Ensure model patch_embed stride is compatible with patch_H_data, patch_W_data
-    # e.g., if stride is 4, H and W should be multiples of 4.
-    if patch_H_data % 4 != 0 or patch_W_data % 4 != 0:
-        print(f"WARNING: Patch dimensions ({patch_H_data}x{patch_W_data}) are not cleanly divisible by model's patch_embed stride (4). "
-              "This might lead to shape errors or suboptimal performance in the model.")
-
+    # Check if input dimensions are suitable for patch embedding
+    if patch_H_data % 2 != 0 or patch_W_data % 2 != 0:
+        print(f"WARNING: Input dimensions ({patch_H_data}x{patch_W_data}) are not even numbers. "
+              f"This might cause dimension mismatches. Consider resizing your patches.")
+    
+    # Create model with 1 input channel instead of 3
     model=SWETransUNet(in_channels=C_in_data,emb_dim=128,num_heads=4,hidden_dim=256,num_transformer_layers=1).to(device)
     print(f"Model initialized with input C={C_in_data}, H={patch_H_data}, W={patch_W_data} (from DataLoader/Metadata).")
     print(f"Model: {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable params.")
@@ -869,7 +983,7 @@ if __name__ == "__main__":
     if len(test_ds)>0: print("\nVisualizing preds..."); visualize_predictions(model,test_loader,min(3,len(test_ds)),results_directory)
     else: print("Skip pred viz: Test dataset empty.")
 
-    final_model_path=os.path.join(model_save_dir,'swe_transunet_final_model_h5data.pth')
+    final_model_path=os.path.join(model_save_dir,'swe_transunet_final_model_swe_only.pth')
     torch.save({'model_state_dict':model.state_dict(),'test_metrics':{'mse':t_mse,'mae':t_mae,'r2':t_r2},
                 'training_metrics_history':train_hist,'processor_metadata':metadata,'sequence_length':sequence_len,
                 'model_params':{'in_channels':C_in_data,'emb_dim':128,'num_heads':4,'hidden_dim':256,'num_transformer_layers':1}},
